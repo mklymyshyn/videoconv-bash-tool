@@ -1,0 +1,32 @@
+About
+=======================
+This is video converting tool written on bash and using ffmpeg.
+You can use delayed convert when only certain amount of clips 
+converting at the same time (queueing).
+
+Required Bash, Ffmpeg and Python.
+
+
+Usage cases
+=======================
+# Convert from .mov to .mp4, convering id 4, use delayed conveting and 
+# create thumbnails when movie converted.
+./convert-video.sh -i iamlegend.mov -o iamlegend.mp4 -t mp4 -q 4 -c -r
+
+
+# Just convert video and set id to 5
+./convert-video.sh -i iamlegend.mov -o iamlegend.mp4 -t mp4 -q 5
+
+# Show status of convertion
+./convert-video.sh -s
+
+# Show status of convertion for specific id
+./convert-video.sh -s -q 5
+
+# Create thumbnails for video
+./convert-video.sh -g -q 5
+
+# Remove information about video convertion (unregister)
+./convert-video.sh -u -q 5
+
+
