@@ -42,20 +42,15 @@ THUMBNAIL_ARGUMENTS="-y -vcodec mjpeg -sameq -vframes 1 -an -f rawvideo"
 THUMBNAIL_EXT=".jpg"
 
 # definition of main variables
-MP4_CONV_ARGS=<< EOF
-        -acodec libfaac -ar 44100 -ab 192k \
-        -ac 2 -subq 7 \
-        -sc_threshold 40 -vcodec libx264 -b 2000k -vpre hq -crf 22 \
-        -cmp +chroma     +parti4x4+partp8x8+partb8x8 \
-        -i_qfactor 0.71 -keyint_min 25 \
-        -b_strategy 1 -g 250 -r 25
-EOF
-
-FLV_CONV_ARGS="-acodec libfaac -ar 22050 -ab 96k -qscale 1"
+#MP4_CONV_ARGS="-acodec libfaac -ar 44100 -ab 192k -ac 2 -subq 7 -sc_threshold 40 -vcodec libx264 -b 2000k -vpre hq -crf 22 -cmp +chroma +parti4x4+partp8x8+partb8x8 -i_qfactor 0.71 -keyint_min 25 -b_strategy 1 -g 250 -r 25"
+MP4_TWOPASS_ARGS_PASS1="-an -pass 1 -vcodec libx264 -vpre hq -b 2000k -bt 2000k -threads 0"
+MP4_TWOPASS_ARGS_PASS2="-acodec libfaac -ab 192k -pass 2 -vcodec libx264 -vpre hq -b 2000k -bt 2000k -threads 0"
+FLV_CONV_ARGS="-acodec libfaac -ar 44100 -ab 128k -qscale 1"
         
 CONV_TYPE=
 NICE_CMD="nice -n 13"
 PYTHON_CMD="python"
+
 
 
 # global variables whith may redefined by options
@@ -72,7 +67,16 @@ DISPLAY_STATUS=
 USE_DELAYED_CONV=
 GENERATE_THUMBNAILS_AFTER_CONVERTING=
 ADDITIONAL_FFMEPEG_ARGUMENTS=
+MAX_VIDEO_DIMENSION="1920x1080"
+GET_VIDEO_INFO=
+FORCE_VIDEO_RESIZE=
+USE_TWO_PASS_ENCODING=
 
+# statuses
+PROCESSING_FLAG_TITLE="Processing"
+COMPLETE_FLAG_TITLE="Complete"
+ERROR_FLAG_TITLE="Error"
+DELAYED_FLAG_TITLE="Delayed"
 
 # display usage message
 usage()
@@ -94,16 +98,26 @@ OPTIONS:
            conversion id defined by -q option
    -q      Queue unique identifier
    -u      Unregister queue with id specified by -q option
-   -g      Generate thumbnails for converted video with ID specified by -q option
+   -g      Generate thumbnails for converted video with 
+           ID specified by -q option
    -r      Use delayed conversion (defined in QUEUE_SIZE)
    -c      Generate thumbnails after converting are finished
-   -f      Custom options for FFMPEG
+   -f      Custom options for FFMPEG. For Two-Pass encoding arguments
+           delimited with ';;'.
+   -p      Specify max dimension of the video clip by width and height.
+           Format: HEIGHTxWIDTH (for example 640x480). Video will be
+           resized proportional. By default it is HD-1080 1920x1080 .
+           This option will be ignored if you specify size option for
+           ffmpeg custom arguments.           
+   -j      Get basic information about specified by -i option file or
+           by -q option
+   -e      Using two-pass encoding
    
 EOF
 }
 
 # parsing arguments
-while getopts "uhsrct:i:o:a:d:f:q:g" OPTION
+while getopts "uhsrcjet:i:o:a:d:p:f:q:g" OPTION
 do
      case $OPTION in
          h)
@@ -146,6 +160,15 @@ do
          f)  
              ADDITIONAL_FFMEPEG_ARGUMENTS=$OPTARG
              ;;
+         p) 
+             MAX_VIDEO_DIMENSION=$OPTARG
+             ;;
+         j) 
+             GET_VIDEO_INFO="1"
+             ;;
+         e)  
+             USE_TWO_PASS_ENCODING="1"
+             ;;
          ?)
              usage
              exit
@@ -161,10 +184,29 @@ FFMPEG="$NICE_CMD $FFMPEG_PATH"
 # ceil math function
 function ceil { echo "[1+]sa $1 $2 ~ 0 !=a p" | dc; }
 
-# get video duration from file
+# get video duration from file via info file
 _get_video_duration(){
     # arguments: path_to_file
     echo `cat $1 | awk '/Duration/{print $2}' | sed 's/,//' | awk -F: '{print $1*60*60 + $2 * 60 + $3 }'`
+}
+
+# get video duration directly from clip via ffmpeg
+_get_video_duration_via_ffmpeg(){
+    # arguments: path_to_video_clip
+    echo `$FFMPEG -i $1 2>&1 | awk '/Duration/{print $2}' | sed 's/,//' | awk -F: '{print $1*60*60 + $2 * 60 + $3 }'`
+}
+
+# if size exist in additional arguments - ignore MAX_VIDEO_DIMENSION option
+_is_forced_video_size(){
+    # arguments: ffmpeg_custom_arguments
+    echo `echo ${1} | grep -P '\-s\s+[0-9]+[x][0-9]+\s+'`
+}
+
+# get video size
+_get_video_size(){
+    # arguments: path_to_file
+    result=`$FFMPEG -i $1 2>&1 grep 'Stream #' | grep 'Video:' | awk '{pos = match($0, "([0-9]+)[x]([0-9]+)"); print substr($0, pos, RLENGTH); }'`
+    echo $result
 }
 
 
@@ -191,13 +233,30 @@ EOF
 
 # get value from ffmpeg prepared string by key
 get_value_by_key(){
-    # arguments: string, key
+    # arguments: string, key, splitter(optional)
     KEY=$2
     SOURCE=$1
+    SPLITTER='='
+    if [ -n "$3" ]; then
+        SPLITTER="${3}"
+    fi
     
-    echo $SOURCE | awk -F\$ '{for(i=1;i<NF;i++)print $i;}' | grep "^${KEY}=" | cut -d '=' -f 2
+    echo $SOURCE | awk -F\$ '{for(i=1;i<NF;i++)print $i;}' | grep "^${KEY}${SPLITTER}" | cut -d "${SPLITTER}" -f 2
 }
 
+# get valuue from ffmpeg string like "Duration: 00:02:03.17, start: 0.000000, bitrate: 6537 kb/s"
+get_value_from_info(){
+    # arguments: str, key
+    awk_rules="{
+        for(i=1; i<=NF; i++)
+            if(index(\$i, \"${2}\") != 0){
+                # implement trim() functionality
+                print \$i
+            }
+    }
+    "
+    echo "${1}" | awk -F, "${awk_rules}" | cut -d : -f 2 | sed -e 's/^[\t ]*//g'
+}
 
 # get file name by conversion id
 _get_file_by_id(){
@@ -232,6 +291,113 @@ _is_in_progress(){
     done    
 }
 
+# change video size if it's more thatn MAX_VIDEO_DIMENSION
+process_video_resize(){
+    # arguments: source_file optional_max_dimension
+    source_file="${1}"
+    max_dim="${2}"
+    
+    video_size=`_get_video_size "${source_file}"`
+    # get source video dimension
+    src_video_width=`echo $video_size | cut -d x -f 1`
+    src_video_height=`echo $video_size | cut -d x -f 2`
+
+    # get destionation max dimension
+    dst_max_width=`echo $max_dim | cut -d x -f 1`
+    dst_max_height=`echo $max_dim | cut -d x -f 2`
+        
+    dim_expr=$(cat<<EOF
+        define min(a, b){ if(a < b){ return a; }else{ return b} }
+        define max(a, b){ if(a > b){ return a; }else{ return b} }
+        define integer_part(x) { auto old_scale; old_scale = scale; scale = 0; x /= 1; scale = old_scale; return (x) }
+
+        scale=4;
+
+        ratio=min($dst_max_width / $src_video_width, $dst_max_height / $src_video_height)
+        # width
+        integer_part(ratio * $src_video_width);
+        # height
+        integer_part(ratio * $src_video_height);
+EOF
+)
+
+
+    if [ $src_video_width -gt $dst_max_width -o $src_video_height -gt $dst_max_height ]; then
+        dst_size=$(echo "${dim_expr}" | bc)
+        dst_width=`echo "${dst_size}" | head -n 1`
+        dst_height=`echo "${dst_size}" | tail -n 1`
+
+        echo "-s ${dst_width}x${dst_height}"
+    fi
+}
+
+# get video information by unique identifier
+video_info_by_id(){
+    #arguments: queue_id
+    info_file=`_get_file_by_id "${1}"`
+    path_fo_file=`cat "${info_file}" | grep 'Input #0' | awk '{print $NF}' | sed "s/\'\://g" | sed "s/\'//g"`    
+    path_to_file=`echo $path_to_file | sed "s/\'//g"`
+
+    status_str=`show_status "${1}" "1"`
+    status=`echo $status_str | awk '{print $(NF-1)}'`
+    
+    # column #7 with progress in percents
+    progress_perc=`echo $status_str | awk '{print $7}'` 
+    # column #5 with progress in seconds
+    progress_sec=`echo $status_str | awk '{print $5}'` 
+    # column #6 with progress in size
+    progress_size=`echo $status_str | awk '{print $6}'`         
+    
+    pass_step=`echo $status_str | awk '{print $NF}'`
+    
+    cat <<EOF
+INFO_FILE=${info_file}
+SOURCE_FILE=${path_fo_file}
+QUEUE_ID=${1} 
+STATUS=${status}
+EOF
+    if [ "${pass_step}" != "N" ]; then
+        echo "TWO_PASS_STEP=${pass_step}"
+    fi
+    
+    if [ "${status}" == "${PROCESSING_FLAG_TITLE}" ]; then
+        cat <<EOF
+PROGRESS=${progress_perc}%
+PROGRESS_SECONDS=${progress_sec}
+PROGRESS_SIZE=${progress_size}
+EOF
+    fi
+    video_info_by_file "${path_fo_file}"
+}
+
+# get info about video by file
+video_info_by_file(){
+    #arguments: filename
+    
+    info_str=`${FFMPEG} -i ${1} 2>&1`
+    
+    # get information about video duration and dimension
+    duration=`_get_video_duration_via_ffmpeg "${1}"`
+    dimension=`_get_video_size "${1}"`
+    
+    # get bitrate
+    bitrate=`get_value_from_info "${info_str}" "bitrate"`
+    
+    # get information about audio
+    audio_str=`echo "${info_str}" | grep 'Audio: '`
+    audio_quality=`echo $audio_str | awk '{print $5}'`
+    audio_lfe=`echo $audio_str | awk '{print $7}' | sed 's/,//g'`
+    
+    cat <<EOF
+DURATION=${duration}
+VIDEO_SIZE=${dimension}
+BITRATE=${bitrate}
+AUDIO_SAMPLE_RATE=${audio_quality}
+AUDIO_LFE=${audio_lfe}
+EOF
+
+}
+
 
 # decide add
 delayed_conversion(){
@@ -244,7 +410,7 @@ delayed_conversion(){
     if [ $count -gt $MAX_QUEUE_COUNT ]; then
         filename=`conversion_queue ${DELAYED_PREFIX}`
         echo "$@" > $filename
-        echo "Delayed"
+        echo "${DELAYED_FLAG_TITLE}"
     fi
 }
 
@@ -367,6 +533,7 @@ have_errors(){
     # arguments: filename
     no_file=`cat $1 | grep "no such file or directory"`
     unknown_format=`cat $1 | grep "Unknown format"`
+    incorrect_frame_size=`cat $1 | grep "Incorrect frame size"`
     
     # change filename to error prefix
     handle_error(){
@@ -381,16 +548,24 @@ have_errors(){
         handle_error $1;
     elif [ -n "$unknown_format" ]; then
         handle_error $1;
+    elif [ -n "$incorrect_frame_size" ]; then
+        handle_error $1
     fi
 }
 
 # display status of conversation
 show_status(){
-    # arguments: unique_id(optional)
+    # arguments: unique_id(optional) skip_headers
     thumbs_dir=`basename $TEMPORARY_THUMBNAILS_DIRECTORY`
+    
+    two_pass_status="N"
+    
     # display status
     # Parse queue files and calculate conversion
-    echo "ID    File    Input    Duration(sec)    Progress(sec)    Progress(size)    Progress(%)    Status"
+    if [ -z "${2}" ]; then
+        echo "ID    File    Input    Duration(sec)    Progress(sec)    Progress(size)    Progress(%)    Status    Pass"
+    fi
+    
     for file in `ls -l "${STATUS_DIRECTORY}" | grep ^- | awk '{print $9}'`; do
         filepath=${STATUS_DIRECTORY}/${file}
 
@@ -399,13 +574,13 @@ show_status(){
 
         conv_status="Unknown"
         if [ "${file_prefix}_" == "${COMPLETE_PREFIX}" ]; then
-            conv_status="Complete"
+            conv_status="${COMPLETE_FLAG_TITLE}"
         elif [ "${file_prefix}_" == "${PROGRESS_PREFIX}" ]; then
-            conv_status="Processing"
+            conv_status="${PROCESSING_FLAG_TITLE}"
         elif [ "${file_prefix}_" == "${ERROR_PREFIX}" ]; then
-            conv_status="Error"            
+            conv_status="${ERROR_FLAG_TITLE}"            
         elif [ "${file_prefix}_" == "${DELAYED_PREFIX}" ]; then
-            conv_status="Delayed"
+            conv_status="${DELAYED_FLAG_TITLE}"
             conv_id="D"
         fi                        
 
@@ -417,14 +592,14 @@ show_status(){
         fi
         
         # display status of conversion with details
-        if [ "$conv_status" != "Error" -a "$conv_status" != "Delayed" ]; then            
+        if [ "$conv_status" != "${ERROR_FLAG_TITLE}" -a "$conv_status" != "${DELAYED_FLAG_TITLE}" ]; then            
             duration=`_get_video_duration $filepath`
             status=`_get_current_progress $filepath`
             already_converted=`get_value_by_key $status 'time'`            
             converted_filesize=`get_value_by_key $status 'Lsize'`
             [[ -z "$converted_filesize" ]] && converted_filesize=`get_value_by_key $status 'size'`
-                                
-            
+
+            two_pass_status=`cat "${filepath}" | grep 'Pass' | cut -d = -f 2`
             source_filename=`cat $filepath | grep 'Input' | awk '{print $NF}' | sed "s/'://g"`
             source_filename=`basename $source_filename`
             
@@ -435,13 +610,16 @@ show_status(){
             converted_filesize="0"
             source_filename="Unknown"            
             progress_in_percents=0
+            two_pass_status='N'
         fi
+        
         # display information about this file
-        printf "%s    %s    %s...    %s    %s    %s    %s    %s\n" \
+        printf "%s    %s    %s...    %s    %s    %s    %s    %s    %s\n" \
                 $conv_id $file ${source_filename:0:5} $duration $already_converted \
                 $converted_filesize \
                 $progress_in_percents \
-                $conv_status        
+                $conv_status \
+                "${two_pass_status}"
     done
     
 }
@@ -488,6 +666,24 @@ fi
 
 if [ ! -d "$TEMPORARY_THUMBNAILS_DIRECTORY" ]; then
     mkdir $TEMPORARY_THUMBNAILS_DIRECTORY
+fi
+
+
+# get info about video
+if [ -n "${GET_VIDEO_INFO}" ]; then
+    # TODO: info about video
+    if [ -n "${QUEUE_UNIQUE_ID}" ]; then
+        video_info_by_id "${QUEUE_UNIQUE_ID}"
+        exit
+    fi
+    
+    if [ -e "${INPUT_FILE}" ]; then
+        video_info_by_file "${INPUT_FILE}"
+        exit
+    fi
+    
+    error "You don't specify unique identifier or source video file doesn't exists."
+    exit
 fi
 
 # show status
@@ -544,16 +740,73 @@ echo "${QUEUE_UNIQUE_ID}" > $queue_filename
 
 # convert to mp4
 if [ "${CONV_TYPE}" == "mp4" ]; then
-    ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_CONV_ARGS "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+    IS_FORCED_SIZE=`_is_forced_video_size "${MP4_CONV_ARGS}"`
+    if [ -z "${IS_FORCED_SIZE}" ]; then
+        # check video dimension here and change it if necessary
+        FORCE_VIDEO_RESIZE=`process_video_resize "${INPUT_FILE}" "${MAX_VIDEO_DIMENSION}"`
+        warn "Force video size to ${FORCE_VIDEO_RESIZE}"
+    fi
+
+    
+    # two pass encoding for MP4 video type
+    if [ -n "${USE_TWO_PASS_ENCODING}" ]; then    
+        PASSLOGFILE_DIR=`dirname "${OUTPUT_FILE}"`
+        PASSLOGFILE_NAME=`basename "${OUTPUT_FILE}"_passlog`
+        PASSLOGFILE="${PASSLOGFILE_DIR}/${PASSLOGFILE_NAME}"        
+        
+        # add information about status
+        echo "Pass=1" >> ${queue_filename}
+        ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS1 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+    
+        # override queue file
+        echo "${QUEUE_UNIQUE_ID}" > $queue_filename
+        echo "Pass=2" >> $queue_filename
+        ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS2 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+    fi
+    
+    echo ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_CONV_ARGS $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
 fi
 # convert to flv
-if [ "${CONV_TYPE}" == "flv" ]; then        
-    ${FFMPEG} -y -i "${INPUT_FILE}" $FLV_CONV_ARGS "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+if [ "${CONV_TYPE}" == "flv" ]; then
+    IS_FORCED_SIZE=`_is_forced_video_size "${FLV_CONV_ARGS}"`
+    if [ -z "${IS_FORCED_SIZE}" ]; then
+        #TODO: check video dimension here and change it if necessary
+        FORCE_VIDEO_RESIZE=`process_video_resize "${INPUT_FILE}" "${MAX_VIDEO_DIMENSION}"`
+        warn "Force video size to ${FORCE_VIDEO_RESIZE}"
+    fi
+    
+    ${FFMPEG} -y -i "${INPUT_FILE}" $FLV_CONV_ARGS $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
 fi
 
 # convert with custom arguments
 if [ -n "${ADDITIONAL_FFMEPEG_ARGUMENTS}" ]; then
-    ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+    IS_FORCED_SIZE=`_is_forced_video_size "${ADDITIONAL_FFMEPEG_ARGUMENTS}"`
+    if [ -z "${IS_FORCED_SIZE}" ]; then
+        # check video dimension here and change it if necessary
+        FORCE_VIDEO_RESIZE=`process_video_resize "${INPUT_FILE}" "${MAX_VIDEO_DIMENSION}"`
+        warn "Force video size to ${FORCE_VIDEO_RESIZE}"
+    fi
+    
+    # two pass encoding with additional params splitted with `;;`
+    if [ -n "${USE_TWO_PASS_ENCODING}" ]; then
+        ADDITIONAL_FFMEPEG_ARGUMENTS_PASS1=`echo "${ADDITIONAL_FFMEPEG_ARGUMENTS}" | awk -F';;' '{print $1}'`
+        ADDITIONAL_FFMEPEG_ARGUMENTS_PASS2=`echo "${ADDITIONAL_FFMEPEG_ARGUMENTS}" | awk -F';;' '{print $2}'`
+        
+        PASSLOGFILE_DIR=`dirname "${OUTPUT_FILE}"`
+        PASSLOGFILE_NAME=`basename "${OUTPUT_FILE}"_passlog`
+        PASSLOGFILE="${PASSLOGFILE_DIR}/${PASSLOGFILE_NAME}"        
+        
+        # add information about status
+        echo "Pass=1" >> ${queue_filename}
+        ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS_PASS1 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+    
+        # override queue file
+        echo "${QUEUE_UNIQUE_ID}" > $queue_filename
+        echo "Pass=2" >> $queue_filename
+        ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS_PASS2 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+    fi
+        
+    ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
 fi
 
 
