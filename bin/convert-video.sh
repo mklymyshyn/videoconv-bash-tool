@@ -78,6 +78,9 @@ COMPLETE_FLAG_TITLE="Complete"
 ERROR_FLAG_TITLE="Error"
 DELAYED_FLAG_TITLE="Delayed"
 
+
+ERROR_WITH_ARGUMENTS="$@"
+
 # display usage message
 usage()
 {
@@ -184,6 +187,37 @@ FFMPEG="$NICE_CMD $FFMPEG_PATH"
 # ceil math function
 function ceil { echo "[1+]sa $1 $2 ~ 0 !=a p" | dc; }
 
+# create scratch
+_prepare_scratch(){
+    # arguments: dst_file_name
+    dst_file="${1}"
+    
+    dst_dir=`dirname "${dst_file}"`
+    scratch_dir=`basename "${dst_file}" | sed 's/[^A-Za-z0-9\_\-]//g'`
+    scratch_dir="${dst_dir}/${scratch_dir}_scratch"
+    
+    # go to scratch dir
+    mkdir "${scratch_dir}"
+    echo "${scratch_dir}"        
+}
+
+# clean scratch
+_cleanup_scratch(){
+    # arguments: scratch_dir
+    SCRATCH="${1}"
+    PREV_DIRNAME=`dirname "$SCRATCH"`
+
+    cd "$PREV_DIRNAME"    
+    if [ "${PREV_DIRNAME}" == "." ]; then
+        cd ".."
+    fi
+
+    for thumb in `ls "$SCRATCH"`; do
+        rm "${SCRATCH}/${thumb}"
+    done
+    rmdir "${SCRATCH}"
+}
+
 # get video duration from file via info file
 _get_video_duration(){
     # arguments: path_to_file
@@ -204,8 +238,16 @@ _is_forced_video_size(){
 
 # get video size
 _get_video_size(){
-    # arguments: path_to_file
-    result=`$FFMPEG -i $1 2>&1 grep 'Stream #' | grep 'Video:' | awk '{pos = match($0, "([0-9]+)[x]([0-9]+)"); print substr($0, pos, RLENGTH); }'`
+    # arguments: path_to_file, info_file(optional)
+    
+    if [ -e "${2}" ]; then
+        data=`cat "${2}"`        
+    else        
+        data=`$FFMPEG -i $1 2>&1`
+    fi
+    
+    result=`echo "${data}" | grep 'Stream #' | head -1 | grep 'Video:' | awk '{pos = match($0, "([0-9]+)[x]([0-9]+)"); print substr($0, pos, RLENGTH); }'`
+    
     echo $result
 }
 
@@ -255,7 +297,7 @@ get_value_from_info(){
             }
     }
     "
-    echo "${1}" | awk -F, "${awk_rules}" | cut -d : -f 2 | sed -e 's/^[\t ]*//g'
+    echo "${1}" | grep -v 'frame=' | awk -F, "${awk_rules}" | cut -d : -f 2 | sed -e 's/^[\t ]*//g'
 }
 
 # get file name by conversion id
@@ -310,14 +352,19 @@ process_video_resize(){
         define min(a, b){ if(a < b){ return a; }else{ return b} }
         define max(a, b){ if(a > b){ return a; }else{ return b} }
         define integer_part(x) { auto old_scale; old_scale = scale; scale = 0; x /= 1; scale = old_scale; return (x) }
-
+        define make_multiple_two(x){
+            if(integer_part(x/2)*2 != x){
+                return x + 1
+            }
+            return x
+        }
         scale=4;
 
         ratio=min($dst_max_width / $src_video_width, $dst_max_height / $src_video_height)
         # width
-        integer_part(ratio * $src_video_width);
+        make_multiple_two(integer_part(ratio * $src_video_width));
         # height
-        integer_part(ratio * $src_video_height);
+        make_multiple_two(integer_part(ratio * $src_video_height));
 EOF
 )
 
@@ -335,10 +382,16 @@ EOF
 video_info_by_id(){
     #arguments: queue_id
     info_file=`_get_file_by_id "${1}"`
+    
+    if [ ! -e "${info_file}" ]; then
+        error "Quque item with id ${1} not found.";
+        exit;
+    fi
+    
     path_fo_file=`cat "${info_file}" | grep 'Input #0' | awk '{print $NF}' | sed "s/\'\://g" | sed "s/\'//g"`    
     path_to_file=`echo $path_to_file | sed "s/\'//g"`
 
-    status_str=`show_status "${1}" "1"`
+    status_str=`show_status "${1}" "1" | head -n 1`    
     status=`echo $status_str | awk '{print $(NF-1)}'`
     
     # column #7 with progress in percents
@@ -356,6 +409,7 @@ SOURCE_FILE=${path_fo_file}
 QUEUE_ID=${1} 
 STATUS=${status}
 EOF
+
     if [ "${pass_step}" != "N" ]; then
         echo "TWO_PASS_STEP=${pass_step}"
     fi
@@ -367,18 +421,28 @@ PROGRESS_SECONDS=${progress_sec}
 PROGRESS_SIZE=${progress_size}
 EOF
     fi
-    video_info_by_file "${path_fo_file}"
+    video_info_by_file "${path_fo_file}" "${info_file}"
 }
 
 # get info about video by file
 video_info_by_file(){
-    #arguments: filename
+    #arguments: filename, info_file(optional)
     
-    info_str=`${FFMPEG} -i ${1} 2>&1`
+    if [ -z "${2}" ]; then
+        info_str=`${FFMPEG} -i ${1} 2>&1`
+
+        # get information about video duration and dimension
+        duration=`_get_video_duration_via_ffmpeg "${1}"`
+        dimension=`_get_video_size "${1}"`        
+    else
+        if [ -e "${2}" ]; then
+            duration=`_get_video_duration ${2}`
+            # get dimension from info file
+            dimension=`_get_video_size "${1}" "${2}"`
+            info_str=`cat ${2}`
+        fi
+    fi
     
-    # get information about video duration and dimension
-    duration=`_get_video_duration_via_ffmpeg "${1}"`
-    dimension=`_get_video_size "${1}"`
     
     # get bitrate
     bitrate=`get_value_from_info "${info_str}" "bitrate"`
@@ -534,12 +598,16 @@ have_errors(){
     no_file=`cat $1 | grep "no such file or directory"`
     unknown_format=`cat $1 | grep "Unknown format"`
     incorrect_frame_size=`cat $1 | grep "Incorrect frame size"`
+    incorrect_option=`cat $1 | grep "Error while opening codec for output stream"`
+    unrecognized_option=`cat $1 | grep "unrecognized option"`
     
     # change filename to error prefix
     handle_error(){
         # arguments: filename
         error_filename=`conversion_queue "${ERROR_PREFIX}"`
         mv $1 $error_filename        
+        
+        echo "Error arguments: ${ERROR_WITH_ARGUMENTS}" >> $error_filename
         echo $error_filename
     }
     
@@ -549,6 +617,12 @@ have_errors(){
     elif [ -n "$unknown_format" ]; then
         handle_error $1;
     elif [ -n "$incorrect_frame_size" ]; then
+        handle_error $1
+    fi
+    if [ -n "$incorrect_option" ]; then        
+        handle_error $1
+    fi
+    if [ -n "$unrecognized_option" ]; then
         handle_error $1
     fi
 }
@@ -590,7 +664,7 @@ show_status(){
                 continue
             fi            
         fi
-        
+
         # display status of conversion with details
         if [ "$conv_status" != "${ERROR_FLAG_TITLE}" -a "$conv_status" != "${DELAYED_FLAG_TITLE}" ]; then            
             duration=`_get_video_duration $filepath`
@@ -601,9 +675,25 @@ show_status(){
 
             two_pass_status=`cat "${filepath}" | grep 'Pass' | cut -d = -f 2`
             source_filename=`cat $filepath | grep 'Input' | awk '{print $NF}' | sed "s/'://g"`
-            source_filename=`basename $source_filename`
+            source_filename=`basename $source_filename`                        
             
-            progress_in_percents=$(ceil `echo "scale=4; ($already_converted / $duration * 100)" | bc` 1)
+            bc_percent_expr="
+                define ceil(n){
+                    old_scale = scale;
+                    scale = 0;
+                    x = n / 1;
+                    scale = old_scale;
+                    if(x != n){
+                        return x+1;
+                    }
+                    return (x)
+                }
+                scale=4; 
+                ceil(${already_converted} / ${duration} * 100)"
+            progress_in_percents=`echo "${bc_percent_expr}" | bc`
+            #echo ${progress_in_percents}
+            #progress_in_percents=$(ceil `echo "scale=4; ($already_converted / $duration * 100)" | bc` 1)
+            
         else
             duration="1"
             already_converted="0"
@@ -615,13 +705,13 @@ show_status(){
         
         # display information about this file
         printf "%s    %s    %s...    %s    %s    %s    %s    %s    %s\n" \
-                $conv_id $file ${source_filename:0:5} $duration $already_converted \
-                $converted_filesize \
-                $progress_in_percents \
-                $conv_status \
-                "${two_pass_status}"
+                "$conv_id" "$file" "${source_filename:0:5}" "$duration" "$already_converted" \
+                "$converted_filesize" \
+                "$progress_in_percents" \
+                "$conv_status" \
+                "${two_pass_status}"                                
     done
-    
+
 }
 
 # get count of current conversion
@@ -714,13 +804,18 @@ fi
 
 # if no input or output names defined
 if [ -z "$QUEUE_UNIQUE_ID" ]; then
-    warn "This conversion doesn't have unique Identifier. Please, specify to work with external unitilities"
+    warn "This conversion doesn't have unique Identifier. Please, specify to work with external utilities"
 fi
 
 # if no input or output file specified generate error message
 if [ -z "$INPUT_FILE" -o -z "$OUTPUT_FILE" ]; then
     error "No input or output files defined"
     usage
+    exit
+fi
+
+if [ ! -e "$INPUT_FILE" ]; then
+    error "Input file doesn't exists"
     exit
 fi
 
@@ -752,8 +847,11 @@ if [ "${CONV_TYPE}" == "mp4" ]; then
     if [ -n "${USE_TWO_PASS_ENCODING}" ]; then    
         PASSLOGFILE_DIR=`dirname "${OUTPUT_FILE}"`
         PASSLOGFILE_NAME=`basename "${OUTPUT_FILE}"_passlog`
-        PASSLOGFILE="${PASSLOGFILE_DIR}/${PASSLOGFILE_NAME}"        
+        PASSLOGFILE="${PASSLOGFILE_DIR}/${PASSLOGFILE_NAME}"
         
+        SCRATCH_DIR=`_prepare_scratch "${OUTPUT_FILE}"`
+        
+        cd "${SCRATCH_DIR}"
         # add information about status
         echo "Pass=1" >> ${queue_filename}
         ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS1 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
@@ -761,7 +859,10 @@ if [ "${CONV_TYPE}" == "mp4" ]; then
         # override queue file
         echo "${QUEUE_UNIQUE_ID}" > $queue_filename
         echo "Pass=2" >> $queue_filename
-        ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS2 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+        ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS2 ${TWOPASS_X264_FILENAME} -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+        
+        _cleanup_scratch "${SCRATCH_DIR}"
+        # remove files
     fi
     
     echo ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_CONV_ARGS $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
@@ -796,6 +897,10 @@ if [ -n "${ADDITIONAL_FFMEPEG_ARGUMENTS}" ]; then
         PASSLOGFILE_NAME=`basename "${OUTPUT_FILE}"_passlog`
         PASSLOGFILE="${PASSLOGFILE_DIR}/${PASSLOGFILE_NAME}"        
         
+        SCRATCH_DIR=`_prepare_scratch "${OUTPUT_FILE}"`
+        
+        cd "${SCRATCH_DIR}"
+                
         # add information about status
         echo "Pass=1" >> ${queue_filename}
         ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS_PASS1 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
@@ -804,6 +909,8 @@ if [ -n "${ADDITIONAL_FFMEPEG_ARGUMENTS}" ]; then
         echo "${QUEUE_UNIQUE_ID}" > $queue_filename
         echo "Pass=2" >> $queue_filename
         ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS_PASS2 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
+        
+        _cleanup_scratch "${SCRATCH_DIR}"        
     fi
         
     ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
