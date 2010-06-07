@@ -6,7 +6,7 @@ import subprocess
 class VideoconvWrapper(object):
     tool_path = "bin/convert-video.sh"
     debug = False
-    
+    error_prefix = "ERROR:"
     def __init__(self, tool_path = None, conv_id = None, source_video = None,
                  debug = False):
         self._options = {}
@@ -20,7 +20,7 @@ class VideoconvWrapper(object):
             self.option("q", conv_id)
             
         if source_video !=None:
-            self.option("i", source_video)
+            self.option("i", source_video)            
     
     def set_video(self, path):
         self.option('i', path)
@@ -52,7 +52,7 @@ class VideoconvWrapper(object):
             args.append('-%s' % name)
         return ""
 
-    def execute_cmd(self, args):        
+    def execute_cmd(self, args):
         args.insert(0, self.tool_path)
         if self.debug:
             print "Command: %s" % " ".join(args)
@@ -60,16 +60,30 @@ class VideoconvWrapper(object):
         p = subprocess.Popen(" ".join(args), shell = True, stdout = subprocess.PIPE)
         return (p.stdin, p.stdout)
         
-    def convert(self):
+    def handle_errors(self, data):
+        # split output to lines and check every line for error message
+        for line in data.split("\n"):
+            if line[0:len(self.error_prefix)] == self.error_prefix:
+                return line
+                
+        return None
+                
+        
+    def convert(self, additional_arguments = []):
         args = []
         map(lambda key: self._pair(args, key), self._options.keys())
-        (stdin, stdout) = self.execute_cmd(args)
+        arguments = args + additional_arguments
+        logging.debug(" ".join(arguments))
+        (stdin, stdout) = self.execute_cmd(arguments)
         output = stdout.read()
-        error_prefix = "ERROR:"
         
-        if output[0:len(error_prefix)] == error_prefix:
-            raise ValueError, "Can't convert video. Reason: %s" % output
+        # split output to lines and check every line for error message
+        error = self.handle_errors(output)
+        if error != None:
+            raise ValueError, "Can't convert video. Reason: %s" % error
 
+        return output
+        
     def unregister(self):
         args = ['-u']
         self._pair(args, name = "q")
@@ -78,22 +92,39 @@ class VideoconvWrapper(object):
         return stdout.read()
         
         
-    def info(self, file = None):        
-        args = ['-j']
-        if not file:
-            self._pair(args, name = "q")
-        else:
-            self._pair(args, name = "i")
-
-        (stdin, stdout) = self.execute_cmd(args)
-        #    raise ValueError, "Can't get information about video. Reason: %s" % str(e)
+    def info(self):   
+        args = []
+        if self.get_option('i') == '' and  self.get_option('q') == '':
+            raise ValueError, "You don't specified path to video or unique identifier"
         
-        reply_pairs = [obj.split('=') for obj in stdout.read().split("\n") if obj != '']
+        map(lambda key: self._pair(args, key), self._options.keys())        
+        
+        
+        args = args + ['-j']
+        logging.debug("INFO ABOUT VIDEO ARGUMENTS: %s" % " ".join(args))
+        
+        (stdin, stdout) = self.execute_cmd(args)
+
+        data = stdout.read()
+        
+        # handle errors
+        error = self.handle_errors(data)
+        if error != None:
+            raise ValueError, "Can't get info about video. Reason: %s" % error
+
+        reply_pairs = [obj.split('=') for obj in data.split("\n") if obj != '']
         reply_dict = {}
         
         for item in reply_pairs:
-            key, val = tuple(item)
-            reply_dict[key.lower()] = val
+            try:
+                key, val = tuple(item)
+                reply_dict[key.lower()] = val
+            except ValueError:
+                try:    
+                    reply_dict[item[0]] = ''
+                except TypeError:
+                    pass
+                    
         
         class ReplyDict(object):
             def __init__(self, data = {}):
@@ -131,4 +162,3 @@ def testing():
     
 if __name__ == "__main__":
     testing()
-    

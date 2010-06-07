@@ -30,11 +30,12 @@
 
 
 # definition of binaries and folders
-FFMPEG_PATH=/opt/local/bin/ffmpeg
+FFMPEG_PATH=ffmpeg
+QT_FASTSTART=qt-faststart
 STATUS_DIRECTORY=/tmp/videoconv
 TEMPORARY_THUMBNAILS_DIRECTORY=/tmp/videoconv/thumbnails
 MAX_QUEUE_COUNT=3
-
+CURRENT_DIRECTORY=`dirname $0`
 
 # offset from video begin in percents
 THUMBNAIL_OFFSETS="3 10 40 70"
@@ -71,6 +72,9 @@ MAX_VIDEO_DIMENSION="1920x1080"
 GET_VIDEO_INFO=
 FORCE_VIDEO_RESIZE=
 USE_TWO_PASS_ENCODING=
+THUMBNAILS_DIRECTORY_ARG=
+
+ABSOLUTE_PATH_TO_SCRIPT=""
 
 # statuses
 PROCESSING_FLAG_TITLE="Processing"
@@ -115,12 +119,14 @@ OPTIONS:
    -j      Get basic information about specified by -i option file or
            by -q option
    -e      Using two-pass encoding
+   -n      Path to directory where thumbnails will be generated
+   
    
 EOF
 }
 
 # parsing arguments
-while getopts "uhsrcjet:i:o:a:d:p:f:q:g" OPTION
+while getopts "uhsrcjet:i:o:a:d:p:f:n:q:g" OPTION
 do
      case $OPTION in
          h)
@@ -131,16 +137,17 @@ do
              CONV_TYPE=$OPTARG
              ;;
          i)
-             INPUT_FILE=$OPTARG
+             INPUT_FILE="${OPTARG}"
              ;;
          o)
-             OUTPUT_FILE=$OPTARG
+             OUTPUT_FILE="${OPTARG}"
              ;;
          a)
-             FFMPEG_PATH=$OPTARG
+             FFMPEG_PATH="${OPTARG}"
              ;;
          d)
-             STATUS_DIRECTORY=$OPTARG
+             
+             STATUS_DIRECTORY="${OPTARG}"
              ;;
          q)
              QUEUE_UNIQUE_ID=$OPTARG
@@ -161,7 +168,7 @@ do
              GENERATE_THUMBNAILS_AFTER_CONVERTING="1"
              ;;
          f)  
-             ADDITIONAL_FFMEPEG_ARGUMENTS=$OPTARG
+             ADDITIONAL_FFMEPEG_ARGUMENTS="${OPTARG}"
              ;;
          p) 
              MAX_VIDEO_DIMENSION=$OPTARG
@@ -171,6 +178,10 @@ do
              ;;
          e)  
              USE_TWO_PASS_ENCODING="1"
+             ;;
+         n)
+             THUMBNAILS_DIRECTORY_ARG="1"
+             TEMPORARY_THUMBNAILS_DIRECTORY="${OPTARG}"
              ;;
          ?)
              usage
@@ -186,6 +197,20 @@ FFMPEG="$NICE_CMD $FFMPEG_PATH"
 
 # ceil math function
 function ceil { echo "[1+]sa $1 $2 ~ 0 !=a p" | dc; }
+
+# add faststart functionality to MP4 files
+mp4_qt_faststart(){    
+    # arguments: in_file
+    CLIP="${1}"
+    TMPFILE="${CLIP}.faststart"
+    
+    # exit if qt-faststart not available
+    [[ `type -P "${QT_FASTSTART}"` != "" ]] && exit;
+    
+    warn "Prepare clip with QT-FASTSTART..."
+    $QT_FASTSTART "${CLIP}" "${TMPFILE}"
+    mv "${TMPFILE}" "${CLIP}"
+}
 
 # create scratch
 _prepare_scratch(){
@@ -218,6 +243,32 @@ _cleanup_scratch(){
     rmdir "${SCRATCH}"
 }
 
+# clean log files
+_cleanup_logfiles(){
+    # arguments: passlogfile_dir, passlogfile_name
+    PASSLOGFILE_DIR="${1}"
+    PASSLOGFILE_NAME="${2}"
+    
+    [ ! -d "${PASSLOGFILE_DIR}" ] && exit;
+    ls "${PASSLOGFILE_DIR}" | grep "^${PASSLOGFILE_NAME}" | while read file; do
+        rm "${PASSLOGFILE_DIR}/${file}";
+    done
+    warn "Directory cleaned up from empty log files."
+}
+
+# getabsolute path to script from argument
+get_absolute_path_to_script(){
+    # arguments: path to script
+    PREV_DIR=`pwd`
+    DEST_DIR=`dirname "${0}"`
+    BASE_NAME=`basename "${0}"`
+    cd "${DEST_DIR}"
+    ABS_PATH=`pwd`
+    cd "${PREV_DIR}"
+    
+    echo "${ABS_PATH}/${BASE_NAME}"
+}
+
 # get video duration from file via info file
 _get_video_duration(){
     # arguments: path_to_file
@@ -246,7 +297,8 @@ _get_video_size(){
         data=`$FFMPEG -i $1 2>&1`
     fi
     
-    result=`echo "${data}" | grep 'Stream #' | head -1 | grep 'Video:' | awk '{pos = match($0, "([0-9]+)[x]([0-9]+)"); print substr($0, pos, RLENGTH); }'`
+    # parse ffmpeg output and get video dimension
+    result=`echo "${data}" | grep 'Stream #' | grep 'Video:' | head -1 | awk '{pos = match($0, "([0-9]+)[x]([0-9]+)"); print substr($0, pos, RLENGTH); }'`
     
     echo $result
 }
@@ -330,7 +382,7 @@ _is_in_progress(){
                 exit
             fi
         fi
-    done    
+    done
 }
 
 # change video size if it's more thatn MAX_VIDEO_DIMENSION
@@ -368,7 +420,12 @@ process_video_resize(){
 EOF
 )
 
-
+    # if eny argument from video dimension are empty - just exit
+    [ -z "$src_video_width" ] && exit;
+    [ -z "$dst_max_width" ] && exit;
+    [ -z "$src_video_height" ] && exit;
+    [ -z "$dst_max_height" ] && exit;
+    
     if [ $src_video_width -gt $dst_max_width -o $src_video_height -gt $dst_max_height ]; then
         dst_size=$(echo "${dim_expr}" | bc)
         dst_width=`echo "${dst_size}" | head -n 1`
@@ -388,8 +445,7 @@ video_info_by_id(){
         exit;
     fi
     
-    path_fo_file=`cat "${info_file}" | grep 'Input #0' | awk '{print $NF}' | sed "s/\'\://g" | sed "s/\'//g"`    
-    path_to_file=`echo $path_to_file | sed "s/\'//g"`
+    path_fo_file=`cat "${info_file}" | grep 'Input #0' | awk '{print $NF}' | awk '{ gsub(":|'\''", "", $0); print $0}'`
 
     status_str=`show_status "${1}" "1" | head -n 1`    
     status=`echo $status_str | awk '{print $(NF-1)}'`
@@ -402,10 +458,12 @@ video_info_by_id(){
     progress_size=`echo $status_str | awk '{print $6}'`         
     
     pass_step=`echo $status_str | awk '{print $NF}'`
+    destination_filename=`cat "${info_file}" | grep 'Destination=' | cut -d = -f 2`
     
     cat <<EOF
 INFO_FILE=${info_file}
 SOURCE_FILE=${path_fo_file}
+DESTINATION_FILE=${destination_filename}
 QUEUE_ID=${1} 
 STATUS=${status}
 EOF
@@ -487,15 +545,16 @@ next_delayed_conversion(){
         exit;
     fi
     
-    for file in `ls -l "${STATUS_DIRECTORY}" | grep ^- | awk '{print $9}' | grep "^${DELAYED_PREFIX}"`; do
-        
+    for file in `ls -l "${STATUS_DIRECTORY}" | grep ^- | awk '{print $9}' | grep "^${DELAYED_PREFIX}"`; do        
         args=`cat ${STATUS_DIRECTORY}/$file`
-        echo "Start delayed conversion with arguments: ${args}"
+        echo "Start delayed conversion with arguments: ${ABSOLUTE_PATH_TO_SCRIPT} ${args}"        
+        logger "Start delayed conversion with arguments: ${ABSOLUTE_PATH_TO_SCRIPT} ${args}"
+        
         # remove this delayed conversion
         rm ${STATUS_DIRECTORY}/$file
         
         # run another one conversion
-        $0 $args
+        ${ABSOLUTE_PATH_TO_SCRIPT} $args
         
         exit
     done
@@ -521,14 +580,15 @@ generate_thumbnails(){
     
     # generate desination folder
     DST_FOLDER="${TEMPORARY_THUMBNAILS_DIRECTORY}/${THUMBS_PREFIX}${VIDEO_ID}"
-    SOURCE_FILENAME=`cat $filepath | grep 'Output' | awk '{print $NF}' | sed "s/'://g"`    
-    SOURCE_FILENAME=`echo $SOURCE_FILENAME | sed "s/'//g"`
+    SOURCE_FILENAME=`cat "${filepath}" | grep 'Output' | awk '{print $NF}' | sed "s/'://g"`    
+    SOURCE_FILENAME=`echo "${SOURCE_FILENAME}" | sed "s/'//g"`
 
     # create empty desination folder
     if [ ! -d "$DST_FOLDER" ]; then
         mkdir $DST_FOLDER
         if [ ! -d "$DST_FOLDER" ]; then
             error "Can't create new directory $DST_FOLDER"
+            logger "generate_thumbnails(): Can't create new directory $DST_FOLDER"            
             exit
         fi        
     fi
@@ -629,9 +689,7 @@ have_errors(){
 
 # display status of conversation
 show_status(){
-    # arguments: unique_id(optional) skip_headers
-    thumbs_dir=`basename $TEMPORARY_THUMBNAILS_DIRECTORY`
-    
+    # arguments: unique_id(optional) skip_headers    
     two_pass_status="N"
     
     # display status
@@ -641,7 +699,7 @@ show_status(){
     fi
     
     for file in `ls -l "${STATUS_DIRECTORY}" | grep ^- | awk '{print $9}'`; do
-        filepath=${STATUS_DIRECTORY}/${file}
+        filepath="${STATUS_DIRECTORY}/${file}"
 
         file_prefix=`echo $file | cut -d _ -f 1`
         conv_id=`head -n 1 $filepath`
@@ -673,9 +731,9 @@ show_status(){
             converted_filesize=`get_value_by_key $status 'Lsize'`
             [[ -z "$converted_filesize" ]] && converted_filesize=`get_value_by_key $status 'size'`
 
-            two_pass_status=`cat "${filepath}" | grep 'Pass' | cut -d = -f 2`
+            two_pass_status=`cat "${filepath}" | grep 'Pass' | cut -d = -f 2`    
             source_filename=`cat $filepath | grep 'Input' | awk '{print $NF}' | sed "s/'://g"`
-            source_filename=`basename $source_filename`                        
+            source_filename=`basename "${source_filename}"`
             
             bc_percent_expr="
                 define ceil(n){
@@ -716,7 +774,28 @@ show_status(){
 
 # get count of current conversion
 conversion_queue(){
-    # arguments: file_prefix
+    # arguments: file_prefix    
+
+    # lock file
+    lockfile="${STATUS_DIRECTORY}/lock"
+    PID=$$
+    logger "execute in ${PID}"
+    if [ -e "${lockfile}" ]; then
+        logger "Access from ${PID} locked..."
+        # while generating id lock generation for all parallel processes
+        while true; do
+            if [ ! -e "${lockfile}" ]; then  
+                logger "Access from ${PID} UNLOCKED..."         
+                break
+            fi
+            logger "CHECKLOCK iteration from ${PID}"
+            sleep 1
+        done
+    fi
+
+    # lock
+    echo "1" > "${lockfile}"
+    
     cur_count=`ls "${STATUS_DIRECTORY}" | grep -c "^${1}"`
     count=$(($cur_count+1))
     new_filename="${STATUS_DIRECTORY}/${1}${count}"
@@ -731,6 +810,14 @@ conversion_queue(){
     fi
     
     touch $new_filename
+    
+    # unlock
+    if [ -e "${lockfile}" ]; then
+        rm "${lockfile}"
+        logger "UNLOCKED in ${PID}"   
+    fi
+     
+    # print new id
     echo $new_filename
 }
 
@@ -749,15 +836,20 @@ warn(){
 }
 
 
+# absolute path to this script
+ABSOLUTE_PATH_TO_SCRIPT=`get_absolute_path_to_script $0`
+
 # create directory if not exist
 if [ ! -d "$STATUS_DIRECTORY" ]; then 
     mkdir $STATUS_DIRECTORY
 fi
 
-if [ ! -d "$TEMPORARY_THUMBNAILS_DIRECTORY" ]; then
-    mkdir $TEMPORARY_THUMBNAILS_DIRECTORY
+if [ -n "${THUMBNAILS_DIRECTORY_ARG}" -o -n "${GENERATE_THUMBNAILS_AFTER_CONVERTING}" -o -n "${GENERATE_THUMBNAILS}" ]; then
+    if [ ! -d "$TEMPORARY_THUMBNAILS_DIRECTORY" ]; then
+        logger "Generating directory for thumbnails: ${TEMPORARY_THUMBNAILS_DIRECTORY}"
+        mkdir -p $TEMPORARY_THUMBNAILS_DIRECTORY
+    fi
 fi
-
 
 # get info about video
 if [ -n "${GET_VIDEO_INFO}" ]; then
@@ -778,7 +870,7 @@ fi
 
 # show status
 if [ -n "$DISPLAY_STATUS" ]; then
-    show_status $QUEUE_UNIQUE_ID | column -xt    
+    show_status "$QUEUE_UNIQUE_ID" | column -xt    
     exit
 fi
 
@@ -789,7 +881,7 @@ if [ -n "$GENERATE_THUMBNAILS" ]; then
         exit;
     fi
     generate_thumbnails $QUEUE_UNIQUE_ID 
-    exit
+    exit;
 fi
 
 # unregister queue
@@ -839,7 +931,9 @@ if [ "${CONV_TYPE}" == "mp4" ]; then
     if [ -z "${IS_FORCED_SIZE}" ]; then
         # check video dimension here and change it if necessary
         FORCE_VIDEO_RESIZE=`process_video_resize "${INPUT_FILE}" "${MAX_VIDEO_DIMENSION}"`
-        warn "Force video size to ${FORCE_VIDEO_RESIZE}"
+        if [ -n "${FORCE_VIDEO_RESIZE}" ]; then
+            warn "Force video size to ${FORCE_VIDEO_RESIZE}"
+        fi
     fi
 
     
@@ -851,16 +945,26 @@ if [ "${CONV_TYPE}" == "mp4" ]; then
         
         SCRATCH_DIR=`_prepare_scratch "${OUTPUT_FILE}"`
         
+        # TODO: Important!!! Change Audio bitrate for small FLV files
         cd "${SCRATCH_DIR}"
         # add information about status
         echo "Pass=1" >> ${queue_filename}
         ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS1 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
-    
+        
         # override queue file
         echo "${QUEUE_UNIQUE_ID}" > $queue_filename
         echo "Pass=2" >> $queue_filename
         ${FFMPEG} -y -i "${INPUT_FILE}" $MP4_TWOPASS_ARGS_PASS2 ${TWOPASS_X264_FILENAME} -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
         
+
+        
+        echo "Destination=${OUTPUT_FILE}" >> $queue_filename
+        
+        # faststart
+        mp4_qt_faststart "${OUTPUT_FILE}"
+        
+        # remove passlog file        
+        _cleanup_logfiles "${PASSLOGFILE_DIR}" "${PASSLOGFILE_NAME}"
         _cleanup_scratch "${SCRATCH_DIR}"
         # remove files
     fi
@@ -910,6 +1014,8 @@ if [ -n "${ADDITIONAL_FFMEPEG_ARGUMENTS}" ]; then
         echo "Pass=2" >> $queue_filename
         ${FFMPEG} -y -i "${INPUT_FILE}" $ADDITIONAL_FFMEPEG_ARGUMENTS_PASS2 -passlogfile ${PASSLOGFILE} $FORCE_VIDEO_RESIZE "${OUTPUT_FILE}" >> ${queue_filename} 2>&1
         
+        
+        echo "Destination=${OUTPUT_FILE}" >> $queue_filename        
         _cleanup_scratch "${SCRATCH_DIR}"        
     fi
         
@@ -918,7 +1024,7 @@ fi
 
 
 # check for errors
-errors=`have_errors ${queue_filename}`
+errors=`have_errors "${queue_filename}"`
 
 # if no errors available mark as complete
 # in other case - display message about error
@@ -931,7 +1037,8 @@ else
     
     # automatically generate thumbnails for converted video
     if [ -n "$QUEUE_UNIQUE_ID" -a -n "${GENERATE_THUMBNAILS_AFTER_CONVERTING}" ]; then
-        $0 -g -q $QUEUE_UNIQUE_ID
+        logger "Start generating thumbnails after video conversation..."
+        ${ABSOLUTE_PATH_TO_SCRIPT} -a "${FFMPEG_PATH}" -d "${STATUS_DIRECTORY}" -n "${TEMPORARY_THUMBNAILS_DIRECTORY}" -q $QUEUE_UNIQUE_ID -g
     fi
 fi
 
